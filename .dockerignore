@@ -1,5 +1,11 @@
 **/*_test.go
-
+.github/
+.git/
+Dockerfile
+docker-compose.yml
+docker-bake.hcl
 build/_workspace
 build/_bin
 tests/testdata
+*.md
+!COPYING
