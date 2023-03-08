@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/utils"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
@@ -2498,4 +2499,120 @@ func (bc *BlockChain) SetBlockValidatorAndProcessorForTesting(v Validator, p Pro
 // It is thread-safe and can be called repeatedly without side effects.
 func (bc *BlockChain) SetTrieFlushInterval(interval time.Duration) {
 	atomic.StoreInt64(&bc.flushInterval, int64(interval))
+}
+
+func (bc *BlockChain) ValidatePayload(block *types.Block, feeRecipient common.Address, expectedProfit *big.Int, registeredGasLimit uint64, vmConfig vm.Config) error {
+	header := block.Header()
+	if err := bc.engine.VerifyHeader(bc, header, true); err != nil {
+		return err
+	}
+
+	current := bc.CurrentBlock()
+	reorg, err := bc.forker.ReorgNeeded(current, header)
+	if err == nil && reorg {
+		return errors.New("block requires a reorg")
+	}
+
+	parent := bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
+	if parent == nil {
+		return errors.New("parent not found")
+	}
+
+	calculatedGasLimit := utils.CalcGasLimit(parent.GasLimit, registeredGasLimit)
+	if calculatedGasLimit != header.GasLimit {
+		return errors.New("incorrect gas limit set")
+	}
+
+	statedb, err := bc.StateAt(parent.Root)
+	if err != nil {
+		return err
+	}
+
+	// The chain importer is starting and stopping trie prefetchers. If a bad
+	// block or other error is hit however, an early return may not properly
+	// terminate the background threads. This defer ensures that we clean up
+	// and dangling prefetcher, without defering each and holding on live refs.
+	defer statedb.StopPrefetcher()
+
+	receipts, _, usedGas, err := bc.processor.Process(block, statedb, vmConfig)
+	if err != nil {
+		return err
+	}
+
+	if err := bc.validator.ValidateBody(block); err != nil {
+		return err
+	}
+
+	if err := bc.validator.ValidateState(block, statedb, receipts, usedGas); err != nil {
+		return err
+	}
+
+	// fee recepient is coinbase, check for the block profit
+	if block.Coinbase() == feeRecipient {
+		parent := bc.GetBlockByHash(block.ParentHash())
+		if parent == nil {
+			return fmt.Errorf("could not find parent of %s", block.ParentHash().Hex())
+		}
+
+		baseFee := block.BaseFee()
+
+		blockProfit := big.NewInt(0)
+		for i, tx := range block.Transactions() {
+			gasTip := tx.EffectiveGasTipValue(baseFee)
+			txFee := big.NewInt(int64(receipts[i].GasUsed))
+			txFee.Mul(txFee, gasTip)
+			blockProfit.Add(blockProfit, txFee)
+		}
+
+		if blockProfit.Cmp(expectedProfit) != 0 {
+			return fmt.Errorf("coinbase inaccurate payment %s, expected %s ", blockProfit.String(), expectedProfit.String())
+		}
+
+		return nil
+	}
+
+	if len(receipts) == 0 {
+		return errors.New("no proposer payment receipt")
+	}
+
+	lastReceipt := receipts[len(receipts)-1]
+	if lastReceipt.Status != types.ReceiptStatusSuccessful {
+		return errors.New("proposer payment not successful")
+	}
+	txIndex := lastReceipt.TransactionIndex
+	if txIndex+1 != uint(len(block.Transactions())) {
+		return fmt.Errorf("proposer payment index not last transaction in the block (%d of %d)", txIndex, len(block.Transactions())-1)
+	}
+
+	paymentTx := block.Transaction(lastReceipt.TxHash)
+	if paymentTx == nil {
+		return errors.New("payment tx not in the block")
+	}
+
+	paymentTo := paymentTx.To()
+	if paymentTo == nil || *paymentTo != feeRecipient {
+		return fmt.Errorf("payment tx not to the proposers fee recipient (%v)", paymentTo)
+	}
+
+	if paymentTx.Value().Cmp(expectedProfit) != 0 {
+		return fmt.Errorf("inaccurate payment %s, expected %s", paymentTx.Value().String(), expectedProfit.String())
+	}
+
+	if len(paymentTx.Data()) != 0 {
+		return fmt.Errorf("malformed proposer payment, contains calldata")
+	}
+
+	if paymentTx.GasPrice().Cmp(block.BaseFee()) != 0 {
+		return fmt.Errorf("malformed proposer payment, gas price not equal to base fee")
+	}
+
+	if paymentTx.GasTipCap().Cmp(block.BaseFee()) != 0 && paymentTx.GasTipCap().Sign() != 0 {
+		return fmt.Errorf("malformed proposer payment, unexpected gas tip cap")
+	}
+
+	if paymentTx.GasFeeCap().Cmp(block.BaseFee()) != 0 {
+		return fmt.Errorf("malformed proposer payment, unexpected gas fee cap")
+	}
+
+	return nil
 }
